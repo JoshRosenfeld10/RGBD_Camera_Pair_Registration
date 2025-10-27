@@ -2,6 +2,7 @@ import logging
 import os
 from typing import Annotated, Optional
 
+import numpy as np
 import slicer, qt, vtk, ctk
 import math
 import numpy
@@ -83,8 +84,11 @@ class RGBD_Camera_Pair_RegistrationWidget(ScriptedLoadableModuleWidget, VTKObser
         # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
         # "setMRMLScene(vtkMRMLScene*)" slot.
         uiWidget.setMRMLScene(slicer.mrmlScene)
-        # self.ui.F_right.setMRMLScene(slicer.mrmlScene)
-        # self.ui.F_top.setMRMLScene(slicer.mrmlScene)
+        self.ui.sequenceBrowser.setMRMLScene(slicer.mrmlScene)
+        self.ui.rightCameraTransform.setMRMLScene(slicer.mrmlScene)
+        self.ui.aboveCameraTransform.setMRMLScene(slicer.mrmlScene)
+        self.ui.rightBoundingBoxSequence.setMRMLScene(slicer.mrmlScene)
+        self.ui.aboveBoundingBoxSequence.setMRMLScene(slicer.mrmlScene)
 
         # Create logic class. Logic implements all computations that should be possible to run
         # in batch mode, without a graphical user interface.
@@ -96,12 +100,10 @@ class RGBD_Camera_Pair_RegistrationWidget(ScriptedLoadableModuleWidget, VTKObser
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
 
-        self.ui.DirectoryButton.connect('directorySelected(QString)', self.updateParameterNodeFromGUI)
-        self.ui.videoIDComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
-
         # Buttons
         self.ui.DirectoryButton.connect('directorySelected(QString)', self.onDatasetSelected)
         self.ui.depthToRASPushButton.connect('clicked(bool)', self.onGetDepthToRAS)
+        self.ui.registerBoundingBoxButton.connect('clicked(bool)', self.onRegisterBoundingBoxButton)
 
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
@@ -135,7 +137,6 @@ class RGBD_Camera_Pair_RegistrationWidget(ScriptedLoadableModuleWidget, VTKObser
         if self._parameterNode:
             self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
             self._parameterNodeGuiTag = None
-            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
 
     def onSceneStartClose(self, caller, event) -> None:
         """Called just before the scene is closed."""
@@ -163,66 +164,26 @@ class RGBD_Camera_Pair_RegistrationWidget(ScriptedLoadableModuleWidget, VTKObser
 
         if self._parameterNode:
             self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
-            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
         self._parameterNode = inputParameterNode
         if self._parameterNode:
             # Note: in the .ui file, a Qt dynamic property called "SlicerParameterName" is set on each
             # ui element that needs connection.
             self._parameterNodeGuiTag = self._parameterNode.connectGui(self.ui)
-            self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
-            self._checkCanApply()
-
-        # Initial GUI update
-        self.updateGUIFromParameterNode()
-
-    def updateGUIFromParameterNode(self, caller=None, event=None):
-        """
-        This method is called whenever parameter node is changed.
-        The module GUI is updated to show the current state of the parameter node.
-        """
-
-        if self._parameterNode is None or self._updatingGUIFromParameterNode:
-            return
-
-        # Make sure GUI changes do not call updateParameterNodeFromGUI (it could cause infinite loop)
-        self._updatingGUIFromParameterNode = True
-
-        # Update node selectors and sliders
-        self.ui.DirectoryButton.directory = self._parameterNode.GetParameter("Dataset")
-        self.ui.videoIDComboBox.setCurrentText(self._parameterNode.GetParameter("Video_ID"))
-
-        # All the GUI updates are done
-        self._updatingGUIFromParameterNode = False
-
-    def updateParameterNodeFromGUI(self, caller=None, event=None):
-        """
-        This method is called when the user makes any change in the GUI.
-        The changes are saved into the parameter node (so that they are restored when the scene is saved and loaded).
-        """
-
-        if self._parameterNode is None or self._updatingGUIFromParameterNode:
-            return
-
-        wasModified = self._parameterNode.StartModify()  # Modify all properties in a single batch
-
-        self._parameterNode.SetParameter("Dataset", str(self.ui.DirectoryButton.directory))
-        self._parameterNode.SetParameter("Video_ID", str(self.ui.videoIDComboBox.currentText))
-
-        self._parameterNode.EndModify(wasModified)
-
-    def _checkCanApply(self, caller=None, event=None) -> None:
-        pass
-        # if self.ui.sequenceBrowserNode.currentNode():
-        #     self.ui.calculateButton.toolTip = _("Calculate skill metrics")
-        #     self.ui.calculateButton.enabled = True
-        # else:
-        #     self.ui.calculateButton.toolTip = _("Select sequence browser")
-        #     self.ui.calculateButton.enabled = False
 
     def onGetDepthToRAS(self):
         with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
             self.logic.getDepthToRAS(
                 self.ui.rightOrAboveComboBox.currentText
+            )
+
+    def onRegisterBoundingBoxButton(self):
+        with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
+            self.logic.registerBoundingBox(
+                self.ui.sequenceBrowser.currentNode(),
+                self.ui.rightCameraTransform.currentNode(),
+                self.ui.aboveCameraTransform.currentNode(),
+                self.ui.rightBoundingBoxSequence.currentNode(),
+                self.ui.aboveBoundingBoxSequence.currentNode()
             )
 
 
@@ -258,8 +219,106 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.referenceFiducialNode = None
         self.cameraView = "RIGHT"
 
+        # TODO: change so both above and right transforms are computed at once
+
     def getParameterNode(self):
         return RGBD_Camera_Pair_RegistrationParameterNode(super().getParameterNode())
+
+    def registerBoundingBox(self, sequenceBrowser, rightCameraTransform, aboveCameraTransform, rightBoundingBoxSequence, aboveBoundingBoxSequence):
+        roiProxy, roiSequence = self.getOrCreateROINodes("TEST")
+
+        # Link ROI to the browser
+        if sequenceBrowser.GetSequenceNode(roiProxy) is None:
+            sequenceBrowser.AddSynchronizedSequenceNode(roiSequence)
+            sequenceBrowser.AddProxyNode(roiProxy, roiSequence)
+
+        # Proxies for the two bounding box sequences
+        proxyRight = sequenceBrowser.GetProxyNode(rightBoundingBoxSequence)
+        proxyAbove = sequenceBrowser.GetProxyNode(aboveBoundingBoxSequence)
+        if proxyRight is None or proxyAbove is None:
+            raise RuntimeError("Sequence Browser must reference both bounding box sequences.")
+
+        # Get number of frames to process
+        nRight = rightBoundingBoxSequence.GetNumberOfDataNodes()
+        nAbove = aboveBoundingBoxSequence.GetNumberOfDataNodes()
+        if nRight <= nAbove:
+            masterSequence = rightBoundingBoxSequence
+            n = nRight
+        else:
+            masterSequence = aboveBoundingBoxSequence
+            n = nAbove
+
+        roiSequence.RemoveAllDataNodes()
+
+        # Process all frames
+        for i in range(n):
+            sequenceBrowser.SetSelectedItemNumber(i)
+            indexValue = masterSequence.GetNthIndexValue(i)  # the time/frame index label of current frame
+
+            # Get 4 corners of bounding box from each view in RAS
+            pointsRight = self.getBoundingBoxInRAS(proxyRight, rightCameraTransform)
+            pointsAbove = self.getBoundingBoxInRAS(proxyAbove, aboveCameraTransform)
+
+            if pointsRight.shape[0] < 4 or pointsAbove.shape[0] < 4:
+                # Skip incomplete frames
+                continue
+
+            pmin, pmax = self.tightAxisAlignedBoundingBox([pointsRight, pointsAbove])
+            center = 0.5 * (pmin + pmax)
+            size = pmax - pmin
+
+            # Make a data node to store in the sequence
+            dataNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode")
+            dataNode.SetCenter(center.tolist())
+            dataNode.SetSize(size.tolist())
+
+            # Store temporary data node into ROI sequence
+            roiSequence.SetDataNodeAtValue(dataNode, indexValue)
+
+            # Remove the temporary data node from the scene
+            slicer.mrmlScene.RemoveNode(dataNode)
+            # self.updateROIFromBounds(roiProxy, pmin, pmax)
+
+            # Set ROI state into the sequence at current frame
+            # sequenceLogic.UpdateSequencesFromProxyNodes(sequenceBrowser, roiProxy)
+
+        sequenceLogic = slicer.modules.sequences.logic()
+        sequenceLogic.UpdateProxyNodesFromSequences(sequenceBrowser)
+
+    def updateROIFromBounds(self, roiProxy, pmin, pmax):
+        center = 0.5 * (pmin + pmax)
+        size = pmax - pmin
+        roiProxy.SetCenter(center.tolist())
+        roiProxy.SetSize(size.tolist())
+
+    def tightAxisAlignedBoundingBox(self, pointsList):
+        pts = np.vstack(pointsList)
+        return pts.min(axis=0), pts.max(axis=0)
+
+    def getBoundingBoxInRAS(self, markupsNode, transformNode):
+        n = markupsNode.GetNumberOfControlPoints()
+        if n == 0:
+            return np.zeros((0,3))
+        gt = vtk.vtkGeneralTransform()
+        transformNode.GetTransformToWorld(gt)
+        out = np.zeros((n,3), dtype=float)
+        p = [0.0,0.0,0.0]
+        for i in range(n):
+            markupsNode.GetNthControlPointPosition(i, p)
+            pw = gt.TransformPoint(p)
+            out[i,:] = pw
+        return out
+
+    def getOrCreateROINodes(self, classname):
+        roiProxy = slicer.util.getFirstNodeByClassByName("vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI") \
+            if slicer.util.getFirstNodeByClassByName(
+            "vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI" ) \
+            else slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI")
+        roiSequence = slicer.util.getFirstNodeByClassByName("vtkMRMLSequenceNode", f"{classname.upper()}_ROI_SEQUENCE") \
+            if slicer.util.getFirstNodeByClassByName(
+            "vtkMRMLSequenceNode", f"{classname.upper()}_ROI_SEQUENCE") \
+            else slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", f"{classname.upper()}_ROI_SEQUENCE")
+        return roiProxy, roiSequence
 
     def getDepthToRAS(self, camera: str):
         self.cameraView = camera
@@ -543,6 +602,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
                     lowestError = error
                     bestImage = self.depthImage.copy()
         self.depthImage = bestImage
+
 
 
 
