@@ -220,17 +220,18 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.cameraView = "RIGHT"
 
         # TODO: change so both above and right transforms are computed at once
+        # TODO: Move the reference fiducials under the DepthToRAS transform to see a better result
 
     def getParameterNode(self):
         return RGBD_Camera_Pair_RegistrationParameterNode(super().getParameterNode())
 
     def registerBoundingBox(self, sequenceBrowser, rightCameraTransform, aboveCameraTransform, rightBoundingBoxSequence, aboveBoundingBoxSequence):
-        roiProxy, roiSequence = self.getOrCreateROINodes("TEST")
+        roiSequence = self.getOrCreateROINodes("TEST")
 
         # Link ROI to the browser
-        if sequenceBrowser.GetSequenceNode(roiProxy) is None:
+        if sequenceBrowser.GetSequenceNode(roiSequence) is None:
             sequenceBrowser.AddSynchronizedSequenceNode(roiSequence)
-            sequenceBrowser.AddProxyNode(roiProxy, roiSequence)
+            # sequenceBrowser.AddProxyNode(roiProxy, roiSequence)
 
         # Proxies for the two bounding box sequences
         proxyRight = sequenceBrowser.GetProxyNode(rightBoundingBoxSequence)
@@ -250,25 +251,86 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
         roiSequence.RemoveAllDataNodes()
 
+        # Remember parameters of last good 3D box to use when one view is occluded
+        lastPmin = None
+        lastPmax = None
+        lastRLength = None  # length along R
+        lastSLength = None  # length along S
+
         # Process all frames
         for i in range(n):
             sequenceBrowser.SetSelectedItemNumber(i)
             indexValue = masterSequence.GetNthIndexValue(i)  # the time/frame index label of current frame
 
             # Get 4 corners of bounding box from each view in RAS
-            pointsRight = self.getBoundingBoxInRAS(proxyRight, rightCameraTransform)
-            pointsAbove = self.getBoundingBoxInRAS(proxyAbove, aboveCameraTransform)
+            pointsRight = self.getBoundingBoxInRAS(proxyRight, rightCameraTransform, minSize=1.0)
+            pointsAbove = self.getBoundingBoxInRAS(proxyAbove, aboveCameraTransform, minSize=1.0)
 
-            if pointsRight.shape[0] < 4 or pointsAbove.shape[0] < 4:
-                # Skip incomplete frames
+            # Check if bounding box is valid for current frame
+            rightOK = pointsRight.shape[0] >= 4
+            aboveOK = pointsAbove.shape[0] >= 4
+
+            if rightOK and aboveOK:
+                # Both cameras working
+                pmin, pmax = self.tightAxisAlignedBoundingBox([pointsRight, pointsAbove])
+                lastPmin, lastPmax = pmin, pmax
+                lastRLength = pmax[0] - pmin[0]
+                lastSLength = pmax[2] - pmin[2]
+
+            elif rightOK and lastPmin is not None and lastPmax is not None and lastRLength is not None and lastSLength is not None:
+                # ABOVE is occluded; build ROI from right and last known position of ROI
+                print(f"ABOVE OCCLUDED; USING RIGHT for frame {i}")
+                rmin, rmax = self.tightAxisAlignedBoundingBox([pointsRight])
+
+                cR = 0.5 * (rmin + rmax)  # center from right
+                cR[0] -= 0.5 * lastRLength
+                pmin = np.array([
+                    cR[0] - 0.5  * lastRLength,
+                    rmin[1],
+                    rmin[2]
+                ], dtype=float)
+                pmax = np.array([
+                    cR[0] + 0.5 * lastRLength,
+                    rmax[1],
+                    rmax[2]
+                ], dtype=float)
+
+                lastPmin, lastPmax = pmin, pmax
+                lastSLength = pmax[2] - pmin[2]
+
+            elif aboveOK and lastPmin is not None and lastPmax is not None:
+                # RIGHT is occluded; build ROI from above and last known position of ROI
+                print(f"RIGHT OCCLUDED; USING ABOVE for frame {i}")
+                amin, amax = self.tightAxisAlignedBoundingBox([pointsAbove])
+
+                cA = 0.5 * (amin + amax)  # center from anterior
+                cA[2] -= 0.5 * lastSLength
+                pmin = np.array([
+                    amin[0],
+                    amin[1],
+                    cA[2] - 0.5 * lastSLength
+                ], dtype=float)
+                pmax = np.array([
+                    amax[0],
+                    amax[1],
+                    cA[2] + 0.5 * lastSLength
+                ], dtype=float)
+
+                lastPmin, lastPmax = pmin, pmax
+                lastRLength = pmax[0] - pmin[0]
+
+            elif lastPmin is not None and lastPmax is not None:
+                # Neither camera view working, reuse last
+                pmin, pmax = lastPmin, lastPmax
+
+            else:
                 continue
 
-            pmin, pmax = self.tightAxisAlignedBoundingBox([pointsRight, pointsAbove])
             center = 0.5 * (pmin + pmax)
             size = pmax - pmin
 
             # Make a data node to store in the sequence
-            dataNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode")
+            dataNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", "TempROINode")
             dataNode.SetCenter(center.tolist())
             dataNode.SetSize(size.tolist())
 
@@ -278,12 +340,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             # Remove the temporary data node from the scene
             slicer.mrmlScene.RemoveNode(dataNode)
             # self.updateROIFromBounds(roiProxy, pmin, pmax)
-
-            # Set ROI state into the sequence at current frame
-            # sequenceLogic.UpdateSequencesFromProxyNodes(sequenceBrowser, roiProxy)
-
-        sequenceLogic = slicer.modules.sequences.logic()
-        sequenceLogic.UpdateProxyNodesFromSequences(sequenceBrowser)
 
     def updateROIFromBounds(self, roiProxy, pmin, pmax):
         center = 0.5 * (pmin + pmax)
@@ -295,30 +351,38 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         pts = np.vstack(pointsList)
         return pts.min(axis=0), pts.max(axis=0)
 
-    def getBoundingBoxInRAS(self, markupsNode, transformNode):
+    def getBoundingBoxInRAS(self, markupsNode, transformNode, minSize=1.0):
         n = markupsNode.GetNumberOfControlPoints()
         if n == 0:
             return np.zeros((0,3))
         gt = vtk.vtkGeneralTransform()
         transformNode.GetTransformToWorld(gt)
-        out = np.zeros((n,3), dtype=float)
+        pts = np.zeros((n,3), dtype=float)
         p = [0.0,0.0,0.0]
         for i in range(n):
             markupsNode.GetNthControlPointPosition(i, p)
             pw = gt.TransformPoint(p)
-            out[i,:] = pw
-        return out
+            pts[i,:] = pw
+
+        # Check size of bounding box
+        pmin = pts.min(axis=0)
+        pmax = pts.max(axis=0)
+        spans = pmax - pmin
+        if (spans[0] < minSize) and (spans[1] < minSize) and (spans[2] < minSize):
+            return np.zeros((0,3))
+
+        return pts
 
     def getOrCreateROINodes(self, classname):
-        roiProxy = slicer.util.getFirstNodeByClassByName("vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI") \
-            if slicer.util.getFirstNodeByClassByName(
-            "vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI" ) \
-            else slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI")
+        # roiProxy = slicer.util.getFirstNodeByClassByName("vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI") \
+        #     if slicer.util.getFirstNodeByClassByName(
+        #     "vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI" ) \
+        #     else slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", f"{classname.upper()}_ROI")
         roiSequence = slicer.util.getFirstNodeByClassByName("vtkMRMLSequenceNode", f"{classname.upper()}_ROI_SEQUENCE") \
             if slicer.util.getFirstNodeByClassByName(
             "vtkMRMLSequenceNode", f"{classname.upper()}_ROI_SEQUENCE") \
             else slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", f"{classname.upper()}_ROI_SEQUENCE")
-        return roiProxy, roiSequence
+        return roiSequence
 
     def getDepthToRAS(self, camera: str):
         self.cameraView = camera
