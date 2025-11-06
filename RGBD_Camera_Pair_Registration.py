@@ -417,15 +417,17 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             modelCornerPoints.AddControlPoint(self.phantomModelBounds[1], self.phantomModelBounds[2],
                                               self.phantomModelBounds[5])
 
-        minDepth = numpy.max(self.depthImage)
+        # THIS IS UPDATED. RIGHT USES MAX, ABOVE USES MIN
+        maxDepth = numpy.max(self.depthImage)
+        minDepth = numpy.min(self.depthImage)
         self.abovePlaneDepth = float(minDepth)
         print(f"MIN DEPTH: {minDepth}")
 
         # PHANTOM BOUNDING BOX FIDUCIALS
         if self.cameraView == "RIGHT":
-            imageCornerPoints.AddControlPoint(minDepth, self.phantomBBox["ymax"], self.phantomBBox["xmin"])
-            imageCornerPoints.AddControlPoint(minDepth, self.phantomBBox["ymin"], self.phantomBBox["xmax"])
-            imageCornerPoints.AddControlPoint(minDepth, self.phantomBBox["ymax"], self.phantomBBox["xmax"])
+            imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymax"], self.phantomBBox["xmin"])
+            imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymin"], self.phantomBBox["xmax"])
+            imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymax"], self.phantomBBox["xmax"])
         else:
             # Above camera view
             imageCornerPoints.AddControlPoint(self.phantomBBox["ymax"], minDepth, self.phantomBBox["xmin"])
@@ -434,9 +436,9 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
         # IMAGE FIDUCIALS
         if self.cameraView == "RIGHT":
-            fullImageCorners.AddControlPoint(minDepth, 480, 0)
-            fullImageCorners.AddControlPoint(minDepth, 0, 640)
-            fullImageCorners.AddControlPoint(minDepth, 480, 640)
+            fullImageCorners.AddControlPoint(maxDepth, 480, 0)
+            fullImageCorners.AddControlPoint(maxDepth, 0, 640)
+            fullImageCorners.AddControlPoint(maxDepth, 480, 640)
         else:
             # Above camera view
             fullImageCorners.AddControlPoint(480, minDepth, 0)
@@ -504,7 +506,8 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         return depthValue
 
     def removeColorizing(self, bbox, imdata):
-        imdata = cv2.flip(imdata, 0)
+        if self.cameraView == "RIGHT":
+            imdata = cv2.flip(imdata, 0)
         bboxImdata = imdata[int(bbox["ymin"]):int(bbox["ymax"]),
                      int(bbox["xmin"]):int(bbox["xmax"])]
         shape = bboxImdata.shape
@@ -519,7 +522,8 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         if len(shape) > 2:
             self.removeColorizing(bbox, imdata)
         else:
-            imdata = cv2.flip(imdata, 0)
+            if self.cameraView == "RIGHT":
+                imdata = cv2.flip(imdata, 0)
             bboxImdata = imdata[int(bbox["ymin"]):int(bbox["ymax"]),
                          int(bbox["xmin"]):int(bbox["xmax"])]
             self.depthImage = numpy.array([[j for j in bboxImdata[i]] for i in range(shape[0])])
@@ -550,19 +554,18 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             for x in range(0, imageShape[1], 10):
                 if self.depthImage[y][x] > 0:
                     depthValue = self.depthImage[y][x]
-                    offset = getattr(self, "abovePlaneDepth", 0.0)
 
                     if bbox["class"] != "phantom":
                         self.fiducialNode.AddFiducialFromArray(
                             numpy.array([depthValue, 480 - (bbox["ymin"] + y), bbox["xmin"] + x])
                             if self.cameraView == "RIGHT" else
-                            numpy.array([480 - (bbox["ymin"] + y), depthValue, bbox["xmin"] + x])
+                            numpy.array([(bbox["ymin"] + y), -1 * depthValue, bbox["xmin"] + x])
                         )
                     else:
                         self.referenceFiducialNode.AddFiducialFromArray(
                             numpy.array([depthValue, 480 - (bbox["ymin"] + y), bbox["xmin"] + x])
                             if self.cameraView == "RIGHT" else
-                            numpy.array([480 - (bbox["ymin"] + y), depthValue, bbox["xmin"] + x])
+                            numpy.array([(bbox["ymin"] + y), -1 * depthValue, bbox["xmin"] + x])
                         )
 
 
