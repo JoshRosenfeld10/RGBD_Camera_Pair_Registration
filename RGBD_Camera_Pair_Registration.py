@@ -1,6 +1,7 @@
 import logging
 import os
 from typing import Annotated, Optional
+from urllib.request import urlretrieve
 
 import numpy as np
 import slicer, qt, vtk, ctk
@@ -16,7 +17,19 @@ from slicer.parameterNodeWrapper import (
     WithinRange,
 )
 
-from slicer import vtkMRMLScalarVolumeNode
+import FiducialsToModelRegistration
+
+
+try:
+    import torch
+except ModuleNotFoundError:
+    slicer.util.pip_install("torch torchvision --index-url https://download.pytorch.org/whl/cu126")
+
+try:
+    from segment_anything import sam_model_registry, SamPredictor
+except ModuleNotFoundError:
+    slicer.util.pip_install("segment_anything")
+    from segment_anything import sam_model_registry, SamPredictor
 
 
 #
@@ -218,9 +231,51 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.fiducialNode = None
         self.referenceFiducialNode = None
         self.cameraView = "RIGHT"
+        self.loadModel()
 
         # TODO: change so both above and right transforms are computed at once
         # TODO: Move the reference fiducials under the DepthToRAS transform to see a better result
+
+    def loadModel(self):
+        sam_checkpoint = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Resources", "sam_vit_h_4b8939.pth")
+        if not os.path.exists(sam_checkpoint):
+            download_url = ("https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth")
+            print("Downloading copy of weights, this may take a few minutes")
+            urlretrieve(download_url, sam_checkpoint)
+        model_type = "vit_h"
+        device = "cuda"
+        self.sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        self.sam.to(device=device)
+        self.predictor = SamPredictor(self.sam)
+
+    def predict(self, image, bbox):
+        # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # check shape to see if image or points list
+        # will only have 2 shape dimensions for poitns list, 3 dims for colour image
+        # for image, set image to self.image
+        # if new image, update attribute
+        # if you get points, update points and do predictions again
+        original_image_shape = (image.shape[0], image.shape[1])
+        self.predictor.set_image(image)
+        bbox_prompt = numpy.array(
+            [int(bbox["xmin"]), int(bbox["ymin"]), int(bbox["xmax"]), int(bbox["ymax"])])
+        masks, scores, logits = self.predictor.predict(
+            box=bbox_prompt,
+            multimask_output=False
+        )
+        bestMask = masks[numpy.argmax(scores), :, :]
+        bestMask = numpy.where(bestMask == True, 1.0, 0.0)
+
+        # bestMask = bestMask[int(bbox["ymin"]):int(bbox["ymax"]),int(bbox["xmin"]):int(bbox["xmax"])]
+        try:
+            mask = slicer.util.getNode("Mask")
+            slicer.util.updateVolumeFromArray(mask, bestMask)
+        except:
+            mask = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
+            mask.SetName("Mask")
+            slicer.util.updateVolumeFromArray(mask, bestMask)
+        return bestMask
+
 
     def getParameterNode(self):
         return RGBD_Camera_Pair_RegistrationParameterNode(super().getParameterNode())
@@ -384,6 +439,11 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             else slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", f"{classname.upper()}_ROI_SEQUENCE")
         return roiSequence
 
+    def convert_pixels_to_mm(self,x_pixels, y_pixels, z_mm, principle_pt=[314.273, 251.183], focal_length=592.667):
+        x_mm = ((x_pixels - principle_pt[0])/focal_length)*(z_mm+0.578)
+        y_mm = ((y_pixels - principle_pt[1])/focal_length)*(z_mm+0.578)
+        return (x_mm, y_mm)
+
     def getDepthToRAS(self, camera: str):
         self.cameraView = camera
         print(self.cameraView)
@@ -410,33 +470,80 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             self.depthToRAS.SetName("DepthToRAS")
             slicer.mrmlScene.AddNode(self.depthToRAS)
 
-        # Get depth video
+        # Get video nodes
         self.depthNode = slicer.util.getFirstNodeByClassByName(
             "vtkMRMLStreamingVolumeNode",
             "Image1DEPTH_Image1DE" if self.cameraView == "RIGHT" else "ImageDEPTH_ImageDEPT"
         )
+        self.rgbNode = slicer.util.getFirstNodeByClassByName(
+            "vtkMRMLStreamingVolumeNode",
+            "Image1RGB_Image1RGB" if self.cameraView == "RIGHT" else "ImageRGB_ImageRGB"
+        )
 
         self.getDepthImage(self.phantomBBox)  # Get the depth image of the first frame of the video (with ROI as phantom bounding box)
         self.getBestComponent(self.phantomModel, self.depthToRAS, self.phantomBBox)  # Try to get depth points of the phantom only
-        self.resizeAndAlignImage()  # Initial registration; align the image corners and phantom bb to the bounds of the phantom model in scene.
+        self.transformFiducialsToModel()
+        # self.resizeAndAlignImage()  # Initial registration; align the image corners and phantom bb to the bounds of the phantom model in scene.
 
         # This is the actual ICP registration after the initial registration
-        self.convertDepthToPoints(self.phantomBBox)
-        self.referenceFiducialNode.SetAndObserveTransformNodeID(self.initialDepthToRAS.GetID())
-        self.referenceFiducialNode.HardenTransform()
+        # self.convertDepthToPoints(self.phantomBBox)
+        # self.referenceFiducialNode.SetAndObserveTransformNodeID(self.initialDepthToRAS.GetID())
+        # self.referenceFiducialNode.HardenTransform()
         slicer.mrmlScene.Modified()
-        self.updateDepthToRASTransform()
-        self.initialDepthToRAS.SetAndObserveTransformNodeID(self.depthToRAS.GetID())
+        # self.updateDepthToRASTransform()
+        # self.initialDepthToRAS.SetAndObserveTransformNodeID(self.depthToRAS.GetID())
+
+    def applyTransformToNode(self, node, transformNode):
+        node.SetAndObserveTransformNodeID(transformNode.GetID())
+
+    def hardenNodeTransform(self, node):
+        slicer.vtkSlicerTransformLogic().hardenTransform(node)
+        node.SetAndObserveTransformNodeID(None)
+
+    def makeLinearTransformNodeFromVTKTransform(self, vtkTransformObject, name):
+        transformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", name)
+        m = vtk.vtkMatrix4x4()
+        vtkTransformObject.GetMatrix(m)
+        transformNode.SetMatrixTransformToParent(m)
+        return transformNode
+
+    def transformFiducialsToModel(self):
+        fid2ModelLogic = FiducialsToModelRegistration.FiducialsToModelRegistrationLogic()
+
+        # 1. Hard coded pre-alignment
+        rotationTransform = vtk.vtkTransform()
+        rotationTransform.PostMultiply()
+        if self.cameraView == "ABOVE":
+            rotationTransform.RotateX(180.0)
+            rotationTransform.RotateY(-90.0)
+        else:  # RIGHT
+            # TODO: this is probably not right, it looks like the right view is inverted
+            rotationTransform.RotateX(-90.0)
+            rotationTransform.RotateZ(-90.0)
+
+        rotationTransformNode = self.makeLinearTransformNodeFromVTKTransform(rotationTransform, "PreAlignmentRotation")
+        self.applyTransformToNode(self.referenceFiducialNode, rotationTransformNode)
+        self.hardenNodeTransform(self.referenceFiducialNode)
+
+        # 2. Rigid transform to model
+        rigidTransformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "RigidTransform")
+        fid2ModelLogic.run(self.referenceFiducialNode, self.phantomModel, rigidTransformNode, transformType=0, numIterations=100)
+        self.applyTransformToNode(self.referenceFiducialNode, rigidTransformNode)
+        self.hardenNodeTransform(self.referenceFiducialNode)
+
+        # 3. Affine transform to model
+        affineTransformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "AffineTransform")
+        fid2ModelLogic.run(self.referenceFiducialNode, self.phantomModel, affineTransformNode, transformType=2, numIterations=100)
+        self.applyTransformToNode(self.referenceFiducialNode, affineTransformNode)
+
+        # TODO: combine all 3 transforms to create the final DepthToRAS transform
+
 
     def updateDepthToRASTransform(self):
         self.fid2ModLogic.run(self.referenceFiducialNode, self.phantomModel, self.depthToRAS, 0, 100)
         # slicer.mrmlScene.Modified()
 
     def resizeAndAlignImage(self):
-        """
-        I believe this is set up for the RGB_right registration. Which side of the phantom the corners register to is hard coded. Have to change this for RGB_above
-        However, may be wrong. Look through code properly to find out
-        """
         try:
             self.initialDepthToRAS = slicer.util.getNode("InitialDepthToRAS")
         except slicer.util.MRMLNodeNotFoundException:
@@ -522,8 +629,8 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
         # slicer.mrmlScene.Modified()
 
-    def getVtkImageDataAsOpenCVMat(self):
-        cameraVolume = self.depthNode
+    def getVtkImageDataAsOpenCVMat(self, cameraVolume):
+        # cameraVolume = self.depthNode
 
         image = cameraVolume.GetImageData()
         shape = list(cameraVolume.GetImageData().GetDimensions())
@@ -537,10 +644,10 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
     def convertRGBtoD(self, pixel1):
         is_disparity = False
-        min_depth = 0.16
-        max_depth = 300.0
-        min_disparity = 1.0 / max_depth
-        max_disparity = 1.0 / min_depth
+        min_depth = 0.0
+        max_depth = 0.4
+        # min_disparity = 1.0 / max_depth
+        # max_disparity = 1.0 / min_depth
         r_value = float(pixel1[0])
         g_value = float(pixel1[1])
         b_value = float(pixel1[2])
@@ -560,45 +667,49 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
         if (hue_value > 0):
             if not is_disparity:
-                z_value = ((min_depth + (max_depth - min_depth) * hue_value / 1529.0) + 0.5);
-                depthValue = z_value
+                z_value = ((min_depth + (max_depth - min_depth) * hue_value / 1529.0))  # + 0.5);
+                depthValue = (((max_depth - min_depth) * (hue_value / 1529.0)))
             else:
-                disp_value = min_disparity + (max_disparity - min_disparity) * hue_value / 1529.0
-                depthValue = ((1.0 / disp_value) / 1000 + 0.5)
+                pass
+                # disp_value = min_disparity + (max_disparity - min_disparity) * hue_value / 1529.0
+                # depthValue = ((1.0 / disp_value) / 1000 + 0.5)
         else:
             depthValue = 0
         return depthValue
 
     def removeColorizing(self, bbox, imdata):
-        if self.cameraView == "RIGHT":
-            imdata = cv2.flip(imdata, 0)
-        bboxImdata = imdata[int(bbox["ymin"]):int(bbox["ymax"]),
-                     int(bbox["xmin"]):int(bbox["xmax"])]
-        shape = bboxImdata.shape
-        self.depthImage = numpy.array([[self.convertRGBtoD(j) for j in bboxImdata[i]] for i in range(shape[0])])
+        # if self.cameraView == "RIGHT":
+        #     imdata = cv2.flip(imdata, 0)
+        # bboxImdata = imdata[int(bbox["ymin"]):int(bbox["ymax"]),
+        #              int(bbox["xmin"]):int(bbox["xmax"])]
+        # shape = bboxImdata.shape
+        # self.depthImage = numpy.array([[self.convertRGBtoD(j) for j in bboxImdata[i]] for i in range(shape[0])])
+        shape = imdata.shape
+        self.depthImage = numpy.array([[self.convertRGBtoD(j) for j in imdata[i]] for i in range(shape[0])])
 
     def getDepthImage(self, bbox):
-        originalImData = self.getVtkImageDataAsOpenCVMat()
+        originalImData = self.getVtkImageDataAsOpenCVMat(self.depthNode)
         imdata = originalImData.copy()
         self.imgShape = imdata.shape
         shape = imdata.shape
+        self.depthImage = imdata
+        #
+        # if len(shape) > 2:
+        #     self.removeColorizing(bbox, imdata)
+        # else:
+        #     if self.cameraView == "RIGHT":
+        #         imdata = cv2.flip(imdata, 0)
+        #     bboxImdata = imdata[int(bbox["ymin"]):int(bbox["ymax"]),
+        #                  int(bbox["xmin"]):int(bbox["xmax"])]
+        #     self.depthImage = numpy.array([[j for j in bboxImdata[i]] for i in range(shape[0])])
 
-        if len(shape) > 2:
-            self.removeColorizing(bbox, imdata)
-        else:
-            if self.cameraView == "RIGHT":
-                imdata = cv2.flip(imdata, 0)
-            bboxImdata = imdata[int(bbox["ymin"]):int(bbox["ymax"]),
-                         int(bbox["xmin"]):int(bbox["xmax"])]
-            self.depthImage = numpy.array([[j for j in bboxImdata[i]] for i in range(shape[0])])
-
-    def convertDepthToPoints(self, bbox):
+    def convertDepthToPoints(self, bbox, mask):
         try:
             self.fiducialNode = slicer.util.getNode("depthFiducials")
             self.fiducialNode.RemoveAllMarkups()
             if bbox["class"] == "phantom":
                 self.referenceFiducialNode = slicer.util.getNode("referenceFiducials")
-                self.referenceFiducialNode.RemoveAllMarkups()
+                self.referenceFiducialNode.RemoveAllControlPoints()
         except slicer.util.MRMLNodeNotFoundException:
             self.fiducialNode = slicer.vtkMRMLMarkupsFiducialNode()
             self.fiducialNode.SetName("depthFiducials")
@@ -607,71 +718,44 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         if bbox["class"] == "phantom":
             try:
                 self.referenceFiducialNode = slicer.util.getNode("referenceFiducials")
-                self.referenceFiducialNode.RemoveAllMarkups()
+                self.referenceFiducialNode.RemoveAllControlPoints()
             except slicer.util.MRMLNodeNotFoundException:
                 self.referenceFiducialNode = slicer.vtkMRMLMarkupsFiducialNode()
                 self.referenceFiducialNode.SetName("referenceFiducials")
                 slicer.mrmlScene.AddNode(self.referenceFiducialNode)
         imageShape = self.depthImage.shape
         fidAddedCount = 0
-        for y in range(0, imageShape[0], 10):
-            for x in range(0, imageShape[1], 10):
-                if self.depthImage[y][x] > 0:
-                    depthValue = self.depthImage[y][x]
+        for y in range(0, imageShape[0], 20):
+            for x in range(0, imageShape[1], 20):
+                if mask[y][x] > 0:
+                    depthValue = self.convertRGBtoD(self.depthImage[y][x])
+                    (x_mm, y_mm) = self.convert_pixels_to_mm(x, y, depthValue)
+                    offset = getattr(self, "abovePlaneDepth", 0.0)
 
                     if bbox["class"] != "phantom":
-                        self.fiducialNode.AddFiducialFromArray(
+                        self.fiducialNode.AddControlPoint(
                             numpy.array([depthValue, 480 - (bbox["ymin"] + y), bbox["xmin"] + x])
                             if self.cameraView == "RIGHT" else
                             numpy.array([(bbox["ymin"] + y), -1 * depthValue, bbox["xmin"] + x])
                         )
                     else:
-                        self.referenceFiducialNode.AddFiducialFromArray(
+                        '''self.referenceFiducialNode.AddControlPoint(
                             numpy.array([depthValue, 480 - (bbox["ymin"] + y), bbox["xmin"] + x])
                             if self.cameraView == "RIGHT" else
-                            numpy.array([(bbox["ymin"] + y), -1 * depthValue, bbox["xmin"] + x])
-                        )
-
+                            numpy.array([(bbox["ymin"] + y), -1*depthValue, bbox["xmin"] + x])
+                        )'''
+                        if depthValue > 0:
+                            self.referenceFiducialNode.AddControlPoint(
+                                numpy.array([x_mm * 1000, depthValue * 1000, y_mm * 1000]))
 
                     fidAddedCount += 1
 
     def getBestComponent(self, model, transform, bbox):
-        '''bboxImdata = self.depthImage[int(bbox["ymin"]):int(bbox["ymax"]),
-                     int(bbox["xmin"]):int(bbox["xmax"])]
-        self.depthImage = numpy.array([[j for j in bboxImdata[i]] for i in range(bboxImdata.shape[0])])'''
-
-        # TODO: OPENCV THRESHOLD ALGORITHM; eventually replace this with SAM
         originalDepthImg = self.depthImage.copy()
-        thresh = cv2.threshold(self.depthImage.astype("uint8"), 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        numlabels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, 8, cv2.CV_32S)
-        lowestError = math.inf
-        bestImage = None
-        print(stats)
-        secondLargest = numpy.partition(stats.flatten(), -2)[-2]
-
-        # Basically try to find which object identified by opencv is the phantom
-        for i in range(numlabels):
-
-            if (bbox["class"] == "phantom" and stats[i][4] >= secondLargest) or (
-                    bbox["class"] == "ultrasound" and stats[i][4] > secondLargest):
-                labelArea = numpy.where(labels == i, originalDepthImg, 0)
-                self.depthImage = labelArea.astype("uint8")
-                self.convertDepthToPoints(bbox)
-                if bbox["class"] == "phantom":
-                    self.fid2ModLogic.run(self.referenceFiducialNode, model, transform, 0, 100)
-                    error = self.fid2ModLogic.ComputeMeanDistance(self.referenceFiducialNode, model, transform)
-                else:
-                    self.fid2ModLogic.run(self.fiducialNode, model, transform, 0, 100)
-                    error = self.fid2ModLogic.ComputeMeanDistance(self.fiducialNode, model, transform)
-                print(error)
-                if error < lowestError:
-                    lowestError = error
-                    bestImage = self.depthImage.copy()
-        self.depthImage = bestImage
-
-
-
+        rgb_img = self.getVtkImageDataAsOpenCVMat(self.rgbNode)
+        best_mask = self.predict(rgb_img, bbox)
+        # self.depthImage = numpy.where(best_mask >= 1, originalDepthImg, 0)
+        self.convertDepthToPoints(bbox, best_mask)
 
 
 #
