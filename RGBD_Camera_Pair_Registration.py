@@ -207,7 +207,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.phantomModel = None
         self.phantomModelBounds = None
         self.phantomBBox = None
-        self.depthToRAS = None
         self.initialDepthToRAS = None
         self.depthNode = None
         self.imgShape = None
@@ -218,7 +217,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.loadModel()
 
         # TODO: change so both above and right transforms are computed at once
-        # TODO: Move the reference fiducials under the DepthToRAS transform to see a better result
 
     def loadModel(self):
         sam_checkpoint = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Resources", "sam_vit_h_4b8939.pth")
@@ -433,13 +431,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.phantomBBox = {"class": "phantom", "xmin": 101, "ymin": 55, "xmax": 101 + 534, "ymax": 55 + 349}\
             if self.cameraView == "RIGHT" else {'class': 'phantom', 'xmin': 136, 'ymin': 73, 'xmax': 640, 'ymax': 480}
 
-        # If DepthToRAS transform doesn't exist, create one
-        self.depthToRAS = slicer.util.getFirstNodeByName("DepthToRAS")
-        if not self.depthToRAS:
-            self.depthToRAS = slicer.vtkMRMLLinearTransformNode()
-            self.depthToRAS.SetName("DepthToRAS")
-            slicer.mrmlScene.AddNode(self.depthToRAS)
-
         # Get video nodes
         self.depthNode = slicer.util.getFirstNodeByClassByName(
             "vtkMRMLStreamingVolumeNode",
@@ -451,7 +442,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         )
 
         self.getDepthImage(self.phantomBBox)  # Get the depth image of the first frame of the video (with ROI as phantom bounding box)
-        self.getBestComponent(self.phantomModel, self.depthToRAS, self.phantomBBox)  # Try to get depth points of the phantom only
+        self.getBestComponent(self.phantomBBox)  # Try to get depth points of the phantom only
         self.transformFiducialsToModel()
         slicer.mrmlScene.Modified()
 
@@ -484,25 +475,45 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             initialTransform.RotateY(-90.0)
             initialTransform.Translate(-200.0, 220.0, -140.0)
 
-        rotationTransformNode = self.makeLinearTransformNodeFromVTKTransform(initialTransform, "PreAlignmentRotation")
-        self.applyTransformToNode(self.referenceFiducialNode, rotationTransformNode)
+        initialTransformNode = self.makeLinearTransformNodeFromVTKTransform(initialTransform, "PreAlignmentRotation")
+        self.applyTransformToNode(self.referenceFiducialNode, initialTransformNode)
         self.hardenNodeTransform(self.referenceFiducialNode)
 
         # 2. Rigid transform to model
-        rigidTransformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "RigidTransform")
+        try:
+            rigidTransformNode = slicer.util.getNode("RigidTransform")
+        except slicer.util.MRMLNodeNotFoundException:
+            rigidTransformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "RigidTransform")
         fid2ModelLogic.run(self.referenceFiducialNode, self.phantomModel, rigidTransformNode, transformType=0, numIterations=100)
         self.applyTransformToNode(self.referenceFiducialNode, rigidTransformNode)
         self.hardenNodeTransform(self.referenceFiducialNode)
 
         # 3. Affine transform to model
-        affineTransformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "AffineTransform")
+        try:
+            affineTransformNode = slicer.util.getNode("AffineTransform")
+        except slicer.util.MRMLNodeNotFoundException:
+            affineTransformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "AffineTransform")
         fid2ModelLogic.run(self.referenceFiducialNode, self.phantomModel, affineTransformNode, transformType=2, numIterations=100)
         self.applyTransformToNode(self.referenceFiducialNode, affineTransformNode)
 
-        # TODO: combine all 3 transforms to create the final DepthToRAS transform
+        # Combine transforms to create the final DepthToRAS transform
+        temp = vtk.vtkMatrix4x4()
+        M = vtk.vtkMatrix4x4()
+        A = vtk.vtkMatrix4x4()
+        initialTransformNode.GetMatrixTransformToParent(A)
+        B = vtk.vtkMatrix4x4()
+        rigidTransformNode.GetMatrixTransformToParent(B)
+        C = vtk.vtkMatrix4x4()
+        affineTransformNode.GetMatrixTransformToParent(C)
 
-    def updateDepthToRASTransform(self):
-        self.fid2ModLogic.run(self.referenceFiducialNode, self.phantomModel, self.depthToRAS, 0, 100)
+        vtk.vtkMatrix4x4.Multiply4x4(B, A, temp)
+        vtk.vtkMatrix4x4.Multiply4x4(C, temp, M)
+
+        try:
+            outputNode = slicer.util.getNode(f"DepthToRAS_{self.cameraView}")
+        except slicer.util.MRMLNodeNotFoundException:
+            outputNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", f"DepthToRAS_{self.cameraView}")
+        outputNode.SetMatrixTransformToParent(M)
 
     def resizeAndAlignImage(self):
         try:
@@ -697,7 +708,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
                     fidAddedCount += 1
 
-    def getBestComponent(self, model, transform, bbox):
+    def getBestComponent(self, bbox):
         rgb_img = self.getVtkImageDataAsOpenCVMat(self.rgbNode)
         best_mask = self.predict(rgb_img, bbox)
         self.convertDepthToPoints(bbox, best_mask)
