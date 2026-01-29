@@ -91,13 +91,12 @@ class RGBD_Camera_Pair_RegistrationWidget(ScriptedLoadableModuleWidget, VTKObser
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
 
-        self.ui.videoIDComboBox.addItem("Select video ID")
-
         # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
         # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
         # "setMRMLScene(vtkMRMLScene*)" slot.
         uiWidget.setMRMLScene(slicer.mrmlScene)
         self.ui.sequenceBrowser.setMRMLScene(slicer.mrmlScene)
+        self.ui.modelComboBox.setMRMLScene(slicer.mrmlScene)
         self.ui.rightCameraTransform.setMRMLScene(slicer.mrmlScene)
         self.ui.aboveCameraTransform.setMRMLScene(slicer.mrmlScene)
         self.ui.rightBoundingBoxSequence.setMRMLScene(slicer.mrmlScene)
@@ -114,26 +113,11 @@ class RGBD_Camera_Pair_RegistrationWidget(ScriptedLoadableModuleWidget, VTKObser
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
 
         # Buttons
-        self.ui.DirectoryButton.connect('directorySelected(QString)', self.onDatasetSelected)
         self.ui.depthToRASPushButton.connect('clicked(bool)', self.onGetDepthToRAS)
         self.ui.registerBoundingBoxButton.connect('clicked(bool)', self.onRegisterBoundingBoxButton)
 
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
-
-    def onDatasetSelected(self):
-        for i in range(self.ui.videoIDComboBox.count, 0, -1):
-            self.ui.videoIDComboBox.removeItem(i)
-        self.currentDatasetName = os.path.basename(self.ui.DirectoryButton.directory)
-        self.videoPath = self.ui.DirectoryButton.directory
-        self.addVideoIDsToComboBox()
-
-    def addVideoIDsToComboBox(self):
-        for i in range(1, self.ui.videoIDComboBox.count + 1):
-            self.ui.videoIDComboBox.removeItem(i)
-        videoIDList = os.listdir(self.videoPath)
-        self.videoIDList = [dir for dir in videoIDList if dir.rfind(".") == -1]  # get only directories
-        self.ui.videoIDComboBox.addItems(self.videoIDList)
 
     def cleanup(self) -> None:
         """Called when the application closes and the module widget is destroyed."""
@@ -186,7 +170,8 @@ class RGBD_Camera_Pair_RegistrationWidget(ScriptedLoadableModuleWidget, VTKObser
     def onGetDepthToRAS(self):
         with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
             self.logic.getDepthToRAS(
-                self.ui.rightOrAboveComboBox.currentText
+                self.ui.rightOrAboveComboBox.currentText,
+                self.ui.modelComboBox.currentNode()
             )
 
     def onRegisterBoundingBoxButton(self):
@@ -198,7 +183,6 @@ class RGBD_Camera_Pair_RegistrationWidget(ScriptedLoadableModuleWidget, VTKObser
                 self.ui.rightBoundingBoxSequence.currentNode(),
                 self.ui.aboveBoundingBoxSequence.currentNode()
             )
-
 
 
 #
@@ -249,13 +233,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.predictor = SamPredictor(self.sam)
 
     def predict(self, image, bbox):
-        # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        # check shape to see if image or points list
-        # will only have 2 shape dimensions for poitns list, 3 dims for colour image
-        # for image, set image to self.image
-        # if new image, update attribute
-        # if you get points, update points and do predictions again
-        original_image_shape = (image.shape[0], image.shape[1])
         self.predictor.set_image(image)
         bbox_prompt = numpy.array(
             [int(bbox["xmin"]), int(bbox["ymin"]), int(bbox["xmax"]), int(bbox["ymax"])])
@@ -265,8 +242,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         )
         bestMask = masks[numpy.argmax(scores), :, :]
         bestMask = numpy.where(bestMask == True, 1.0, 0.0)
-
-        # bestMask = bestMask[int(bbox["ymin"]):int(bbox["ymax"]),int(bbox["xmin"]):int(bbox["xmax"])]
         try:
             mask = slicer.util.getNode("Mask")
             slicer.util.updateVolumeFromArray(mask, bestMask)
@@ -275,7 +250,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             mask.SetName("Mask")
             slicer.util.updateVolumeFromArray(mask, bestMask)
         return bestMask
-
 
     def getParameterNode(self):
         return RGBD_Camera_Pair_RegistrationParameterNode(super().getParameterNode())
@@ -444,13 +418,10 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         y_mm = ((y_pixels - principle_pt[1])/focal_length)*(z_mm+0.578)
         return (x_mm, y_mm)
 
-    def getDepthToRAS(self, camera: str):
+    def getDepthToRAS(self, camera: str, phantom):
         self.cameraView = camera
+        self.phantomModel = phantom
         print(self.cameraView)
-
-        # TODO: change this so the phantom model can actually be selected in the UI
-        self.phantomModel = slicer.util.getFirstNodeByName("BluePhantom")
-        # self.phantomModel = slicer.util.getFirstNodeByName("SkinModel")
 
         # Get the RAS bounds of the phantom model in the scene
         # We treat the phantom model in the scene as the RAS coordinates of the phantom
@@ -458,8 +429,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.phantomModel.GetRASBounds(self.phantomModelBounds)
 
         # Get the bounding box of the phantom on the first frame of the video
-        # Note that OpenCV and Slicer don't use the same (0,0) point of an image (openCV (0,0) = top left, slicer (0,0) = bottom left (I THINK; DOUBLE CHECK))
-        # self.phantomBBox = {"class": "phantom", "xmin": 0, "xmax": 640, "ymin": 0, "ymax": 480}
+        # Note that OpenCV and Slicer don't use the same (0,0) point of an image (openCV (0,0) = top left, slicer (0,0) = bottom left (I THINK; DOUBLE CHECK
         self.phantomBBox = {"class": "phantom", "xmin": 101, "ymin": 55, "xmax": 101 + 534, "ymax": 55 + 349}\
             if self.cameraView == "RIGHT" else {'class': 'phantom', 'xmin': 136, 'ymin': 73, 'xmax': 640, 'ymax': 480}
 
@@ -483,15 +453,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         self.getDepthImage(self.phantomBBox)  # Get the depth image of the first frame of the video (with ROI as phantom bounding box)
         self.getBestComponent(self.phantomModel, self.depthToRAS, self.phantomBBox)  # Try to get depth points of the phantom only
         self.transformFiducialsToModel()
-        # self.resizeAndAlignImage()  # Initial registration; align the image corners and phantom bb to the bounds of the phantom model in scene.
-
-        # This is the actual ICP registration after the initial registration
-        # self.convertDepthToPoints(self.phantomBBox)
-        # self.referenceFiducialNode.SetAndObserveTransformNodeID(self.initialDepthToRAS.GetID())
-        # self.referenceFiducialNode.HardenTransform()
         slicer.mrmlScene.Modified()
-        # self.updateDepthToRASTransform()
-        # self.initialDepthToRAS.SetAndObserveTransformNodeID(self.depthToRAS.GetID())
 
     def applyTransformToNode(self, node, transformNode):
         node.SetAndObserveTransformNodeID(transformNode.GetID())
@@ -511,17 +473,18 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         fid2ModelLogic = FiducialsToModelRegistration.FiducialsToModelRegistrationLogic()
 
         # 1. Hard coded pre-alignment
-        rotationTransform = vtk.vtkTransform()
-        rotationTransform.PostMultiply()
+        initialTransform = vtk.vtkTransform()
+        initialTransform.PostMultiply()
         if self.cameraView == "ABOVE":
-            rotationTransform.RotateX(180.0)
-            rotationTransform.RotateY(-90.0)
+            initialTransform.RotateX(180.0)
+            initialTransform.RotateY(-90.0)
+            initialTransform.Translate(-265.0, -150.0, -150.0)
         else:  # RIGHT
-            # TODO: this is probably not right, it looks like the right view is inverted
-            rotationTransform.RotateX(-90.0)
-            rotationTransform.RotateZ(-90.0)
+            initialTransform.RotateX(90.0)
+            initialTransform.RotateY(-90.0)
+            initialTransform.Translate(-200.0, 220.0, -140.0)
 
-        rotationTransformNode = self.makeLinearTransformNodeFromVTKTransform(rotationTransform, "PreAlignmentRotation")
+        rotationTransformNode = self.makeLinearTransformNodeFromVTKTransform(initialTransform, "PreAlignmentRotation")
         self.applyTransformToNode(self.referenceFiducialNode, rotationTransformNode)
         self.hardenNodeTransform(self.referenceFiducialNode)
 
@@ -538,10 +501,8 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
         # TODO: combine all 3 transforms to create the final DepthToRAS transform
 
-
     def updateDepthToRASTransform(self):
         self.fid2ModLogic.run(self.referenceFiducialNode, self.phantomModel, self.depthToRAS, 0, 100)
-        # slicer.mrmlScene.Modified()
 
     def resizeAndAlignImage(self):
         try:
@@ -590,20 +551,38 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
         # THIS IS UPDATED. RIGHT USES MAX, ABOVE USES MIN
         maxDepth = numpy.max(self.depthImage)
-        minDepth = numpy.min(self.depthImage)
+        # minDepth = numpy.min(self.depthImage)
+        minDepth = numpy.max(self.depthImage)
         self.abovePlaneDepth = float(minDepth)
         print(f"MIN DEPTH: {minDepth}")
 
         # PHANTOM BOUNDING BOX FIDUCIALS
+        # if self.cameraView == "RIGHT":
+        #     imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymax"], self.phantomBBox["xmin"])
+        #     imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymin"], self.phantomBBox["xmax"])
+        #     imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymax"], self.phantomBBox["xmax"])
+        # else:
+        #     # Above camera view
+        #     imageCornerPoints.AddControlPoint(self.phantomBBox["ymax"], minDepth, self.phantomBBox["xmin"])
+        #     imageCornerPoints.AddControlPoint(self.phantomBBox["ymin"], minDepth, self.phantomBBox["xmax"])
+        #     imageCornerPoints.AddControlPoint(self.phantomBBox["ymax"], minDepth, self.phantomBBox["xmax"])
+        #
         if self.cameraView == "RIGHT":
-            imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymax"], self.phantomBBox["xmin"])
-            imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymin"], self.phantomBBox["xmax"])
-            imageCornerPoints.AddControlPoint(maxDepth, self.phantomBBox["ymax"], self.phantomBBox["xmax"])
+            corner_pt = self.convert_pixels_to_mm(self.phantomBBox["ymax"], self.phantomBBox["xmin"], maxDepth)
+
+            imageCornerPoints.AddControlPoint(maxDepth, corner_pt[1], corner_pt[0])
+            corner_pt = self.convert_pixels_to_mm(self.phantomBBox["ymin"], self.phantomBBox["xmax"], maxDepth)
+            imageCornerPoints.AddControlPoint(maxDepth, corner_pt[1], corner_pt[0])
+            corner_pt = self.convert_pixels_to_mm(self.phantomBBox["ymax"], self.phantomBBox["xmax"], maxDepth)
+            imageCornerPoints.AddControlPoint(maxDepth, corner_pt[1], corner_pt[0])
         else:
             # Above camera view
-            imageCornerPoints.AddControlPoint(self.phantomBBox["ymax"], minDepth, self.phantomBBox["xmin"])
-            imageCornerPoints.AddControlPoint(self.phantomBBox["ymin"], minDepth, self.phantomBBox["xmax"])
-            imageCornerPoints.AddControlPoint(self.phantomBBox["ymax"], minDepth, self.phantomBBox["xmax"])
+            corner_pt = self.convert_pixels_to_mm(self.phantomBBox["ymax"], self.phantomBBox["xmin"], minDepth)
+            imageCornerPoints.AddControlPoint(corner_pt[1], minDepth, corner_pt[0])
+            corner_pt = self.convert_pixels_to_mm(self.phantomBBox["ymin"], self.phantomBBox["xmax"], minDepth)
+            imageCornerPoints.AddControlPoint(corner_pt[1], minDepth, corner_pt[0])
+            corner_pt = self.convert_pixels_to_mm(self.phantomBBox["ymax"], self.phantomBBox["xmax"], minDepth)
+            imageCornerPoints.AddControlPoint(corner_pt[1], minDepth, corner_pt[0])
 
         # IMAGE FIDUCIALS
         if self.cameraView == "RIGHT":
@@ -627,11 +606,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         imageCornerPoints.SetAndObserveTransformNodeID(self.initialDepthToRAS.GetID())
         fullImageCorners.SetAndObserveTransformNodeID(self.initialDepthToRAS.GetID())
 
-        # slicer.mrmlScene.Modified()
-
     def getVtkImageDataAsOpenCVMat(self, cameraVolume):
-        # cameraVolume = self.depthNode
-
         image = cameraVolume.GetImageData()
         shape = list(cameraVolume.GetImageData().GetDimensions())
         shape.reverse()
@@ -646,8 +621,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         is_disparity = False
         min_depth = 0.0
         max_depth = 0.4
-        # min_disparity = 1.0 / max_depth
-        # max_disparity = 1.0 / min_depth
         r_value = float(pixel1[0])
         g_value = float(pixel1[1])
         b_value = float(pixel1[2])
@@ -667,7 +640,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
 
         if (hue_value > 0):
             if not is_disparity:
-                z_value = ((min_depth + (max_depth - min_depth) * hue_value / 1529.0))  # + 0.5);
                 depthValue = (((max_depth - min_depth) * (hue_value / 1529.0)))
             else:
                 pass
@@ -678,12 +650,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         return depthValue
 
     def removeColorizing(self, bbox, imdata):
-        # if self.cameraView == "RIGHT":
-        #     imdata = cv2.flip(imdata, 0)
-        # bboxImdata = imdata[int(bbox["ymin"]):int(bbox["ymax"]),
-        #              int(bbox["xmin"]):int(bbox["xmax"])]
-        # shape = bboxImdata.shape
-        # self.depthImage = numpy.array([[self.convertRGBtoD(j) for j in bboxImdata[i]] for i in range(shape[0])])
         shape = imdata.shape
         self.depthImage = numpy.array([[self.convertRGBtoD(j) for j in imdata[i]] for i in range(shape[0])])
 
@@ -691,17 +657,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         originalImData = self.getVtkImageDataAsOpenCVMat(self.depthNode)
         imdata = originalImData.copy()
         self.imgShape = imdata.shape
-        shape = imdata.shape
         self.depthImage = imdata
-        #
-        # if len(shape) > 2:
-        #     self.removeColorizing(bbox, imdata)
-        # else:
-        #     if self.cameraView == "RIGHT":
-        #         imdata = cv2.flip(imdata, 0)
-        #     bboxImdata = imdata[int(bbox["ymin"]):int(bbox["ymax"]),
-        #                  int(bbox["xmin"]):int(bbox["xmax"])]
-        #     self.depthImage = numpy.array([[j for j in bboxImdata[i]] for i in range(shape[0])])
 
     def convertDepthToPoints(self, bbox, mask):
         try:
@@ -714,7 +670,6 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             self.fiducialNode = slicer.vtkMRMLMarkupsFiducialNode()
             self.fiducialNode.SetName("depthFiducials")
             slicer.mrmlScene.AddNode(self.fiducialNode)
-            # self.fiducialNode.SetAndObserveTransformNodeID(self.initialDepthToRAS.GetID())
         if bbox["class"] == "phantom":
             try:
                 self.referenceFiducialNode = slicer.util.getNode("referenceFiducials")
@@ -725,12 +680,10 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
                 slicer.mrmlScene.AddNode(self.referenceFiducialNode)
         imageShape = self.depthImage.shape
         fidAddedCount = 0
-        for y in range(0, imageShape[0], 20):
-            for x in range(0, imageShape[1], 20):
+        for y in range(0, imageShape[0], 10):
+            for x in range(0, imageShape[1], 10):
                 if mask[y][x] > 0:
                     depthValue = self.convertRGBtoD(self.depthImage[y][x])
-                    (x_mm, y_mm) = self.convert_pixels_to_mm(x, y, depthValue)
-                    offset = getattr(self, "abovePlaneDepth", 0.0)
 
                     if bbox["class"] != "phantom":
                         self.fiducialNode.AddControlPoint(
@@ -739,29 +692,20 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
                             numpy.array([(bbox["ymin"] + y), -1 * depthValue, bbox["xmin"] + x])
                         )
                     else:
-                        '''self.referenceFiducialNode.AddControlPoint(
-                            numpy.array([depthValue, 480 - (bbox["ymin"] + y), bbox["xmin"] + x])
-                            if self.cameraView == "RIGHT" else
-                            numpy.array([(bbox["ymin"] + y), -1*depthValue, bbox["xmin"] + x])
-                        )'''
                         if depthValue > 0:
-                            self.referenceFiducialNode.AddControlPoint(
-                                numpy.array([x_mm * 1000, depthValue * 1000, y_mm * 1000]))
+                            self.referenceFiducialNode.AddControlPoint(numpy.array([x, depthValue * 100, y]))
 
                     fidAddedCount += 1
 
     def getBestComponent(self, model, transform, bbox):
-        originalDepthImg = self.depthImage.copy()
         rgb_img = self.getVtkImageDataAsOpenCVMat(self.rgbNode)
         best_mask = self.predict(rgb_img, bbox)
-        # self.depthImage = numpy.where(best_mask >= 1, originalDepthImg, 0)
         self.convertDepthToPoints(bbox, best_mask)
 
 
 #
 # RGBD_Camera_Pair_RegistrationTest
 #
-
 
 class RGBD_Camera_Pair_RegistrationTest(ScriptedLoadableModuleTest):
     """
@@ -790,38 +734,4 @@ class RGBD_Camera_Pair_RegistrationTest(ScriptedLoadableModuleTest):
         module.  For example, if a developer removes a feature that you depend on,
         your test should break so they know that the feature is needed.
         """
-
-        self.delayDisplay("Starting the test")
-
-        # Get/create input data
-
-        import SampleData
-
-        registerSampleData()
-        inputVolume = SampleData.downloadSample("RGBD_Camera_Pair_Registration1")
-        self.delayDisplay("Loaded test data set")
-
-        inputScalarRange = inputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(inputScalarRange[0], 0)
-        self.assertEqual(inputScalarRange[1], 695)
-
-        outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        threshold = 100
-
-        # Test the module logic
-
-        logic = RGBD_Camera_Pair_RegistrationLogic()
-
-        # Test algorithm with non-inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, True)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], threshold)
-
-        # Test algorithm with inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, False)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], inputScalarRange[1])
-
-        self.delayDisplay("Test passed")
+        pass

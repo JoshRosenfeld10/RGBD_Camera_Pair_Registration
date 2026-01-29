@@ -22,6 +22,9 @@
      </item>
      <item>
       <widget class="qMRMLNodeComboBox" name="sequenceBrowser">
+       <property name="enabled">
+        <bool>true</bool>
+       </property>
        <property name="nodeTypes">
         <stringlist notr="true">
          <string>vtkMRMLSequenceBrowserNode</string>
@@ -44,24 +47,82 @@
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_2">
       <item>
-       <widget class="ctkDirectoryButton" name="DirectoryButton"/>
-      </item>
-      <item>
-       <widget class="QComboBox" name="videoIDComboBox"/>
-      </item>
-      <item>
-       <widget class="QComboBox" name="rightOrAboveComboBox">
+       <layout class="QHBoxLayout" name="horizontalLayout_4">
         <item>
-         <property name="text">
-          <string>RIGHT</string>
-         </property>
+         <widget class="QLabel" name="label_6">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Fixed" vsizetype="Preferred">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="minimumSize">
+           <size>
+            <width>85</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>Camera:</string>
+          </property>
+         </widget>
         </item>
         <item>
-         <property name="text">
-          <string>ABOVE</string>
-         </property>
+         <widget class="QComboBox" name="rightOrAboveComboBox">
+          <item>
+           <property name="text">
+            <string>RIGHT</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>ABOVE</string>
+           </property>
+          </item>
+         </widget>
         </item>
-       </widget>
+       </layout>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="horizontalLayout_7">
+        <item>
+         <widget class="QLabel" name="label_7">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Fixed" vsizetype="Preferred">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="minimumSize">
+           <size>
+            <width>85</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>Phantom Model:</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="qMRMLNodeComboBox" name="modelComboBox">
+          <property name="enabled">
+           <bool>true</bool>
+          </property>
+          <property name="nodeTypes">
+           <stringlist notr="true">
+            <string>vtkMRMLModelNode</string>
+           </stringlist>
+          </property>
+          <property name="hideChildNodeTypes">
+           <stringlist notr="true"/>
+          </property>
+          <property name="interactionNodeSingletonTag">
+           <string notr="true"/>
+          </property>
+         </widget>
+        </item>
+       </layout>
       </item>
       <item>
        <widget class="QPushButton" name="depthToRASPushButton">
@@ -253,11 +314,6 @@
    <extends>QWidget</extends>
    <header>ctkCollapsibleButton.h</header>
    <container>1</container>
-  </customwidget>
-  <customwidget>
-   <class>ctkDirectoryButton</class>
-   <extends>QWidget</extends>
-   <header>ctkDirectoryButton.h</header>
   </customwidget>
   <customwidget>
    <class>qMRMLNodeComboBox</class>
