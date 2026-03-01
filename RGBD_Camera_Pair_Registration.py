@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from typing import Annotated, Optional
 from urllib.request import urlretrieve
 
@@ -253,7 +254,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
         return RGBD_Camera_Pair_RegistrationParameterNode(super().getParameterNode())
 
     def registerBoundingBox(self, sequenceBrowser, rightCameraTransform, aboveCameraTransform, rightBoundingBoxSequence, aboveBoundingBoxSequence):
-        roiSequence = self.getOrCreateROINodes("TEST")
+        roiSequence = self.getOrCreateROINodes(re.split(r"[_ ]+", rightBoundingBoxSequence.GetName())[0])  # split by " " or "_"
 
         # Link ROI to the browser
         if sequenceBrowser.GetSequenceNode(roiSequence) is None:
@@ -310,7 +311,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
                 rmin, rmax = self.tightAxisAlignedBoundingBox([pointsRight])
 
                 cR = 0.5 * (rmin + rmax)  # center from right
-                cR[0] -= 0.5 * lastRLength
+                cR[0] += 0.5 * lastRLength
                 pmin = np.array([
                     cR[0] - 0.5  * lastRLength,
                     rmin[1],
