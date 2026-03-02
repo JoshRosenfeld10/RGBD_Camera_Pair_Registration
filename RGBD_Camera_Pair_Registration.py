@@ -524,21 +524,21 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
             self.initialDepthToRAS.SetName("InitialDepthToRAS")
         try:
             modelCornerPoints = slicer.util.getNode("ModelCorners")
-            modelCornerPoints.RemoveAllMarkups()
+            modelCornerPoints.RemoveAllControlPoints()
         except slicer.util.MRMLNodeNotFoundException:
             modelCornerPoints = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode")
             modelCornerPoints.SetName("ModelCorners")
 
         try:
             imageCornerPoints = slicer.util.getNode("BBoxCorners")
-            imageCornerPoints.RemoveAllMarkups()
+            imageCornerPoints.RemoveAllControlPoints()
         except slicer.util.MRMLNodeNotFoundException:
             imageCornerPoints = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode")
             imageCornerPoints.SetName("BBoxCorners")
 
         try:
             fullImageCorners = slicer.util.getNode("ImageCorners")
-            fullImageCorners.RemoveAllMarkups()
+            fullImageCorners.RemoveAllControlPoints()
         except slicer.util.MRMLNodeNotFoundException:
             fullImageCorners = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode")
             fullImageCorners.SetName("ImageCorners")
@@ -674,7 +674,7 @@ class RGBD_Camera_Pair_RegistrationLogic(ScriptedLoadableModuleLogic):
     def convertDepthToPoints(self, bbox, mask):
         try:
             self.fiducialNode = slicer.util.getNode("depthFiducials")
-            self.fiducialNode.RemoveAllMarkups()
+            self.fiducialNode.RemoveAllControlPoints()
             if bbox["class"] == "phantom":
                 self.referenceFiducialNode = slicer.util.getNode("referenceFiducials")
                 self.referenceFiducialNode.RemoveAllControlPoints()
